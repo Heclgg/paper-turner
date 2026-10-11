@@ -3,10 +3,19 @@
 #include <BLEServer.h>
 #include <BLE2902.h>
 #include "esp32-hal-rgb-led.h"
+#include "esp_sleep.h"
+#include "driver/gpio.h"
+#include <math.h>
+
+#ifndef PI
+#define PI 3.14159265358979323846
+#endif
+
 
 #define PIN_LED             10
 #define BRIGHTNESS_SCALE    168
-#define RED_BLINK_MS        500
+#define BREATH_PERIOD_MS    2000   // 呼吸灯完整周期（明→暗→明）
+#define BREATH_UPDATE_MS    20     // 呼吸灯刷新间隔
 #define GREEN_BLINK_MS      200
 
 // ==================== XT-EINK BLE 协议 ====================
@@ -36,6 +45,9 @@
 #define BOTH_PRESS_SHUTDOWN_MS      2500
 #define BOTH_PRESS_GRACE_MS         50   // 同时按下检测窗口：延迟单键命令以等待另一键
 
+// 配对超时进入低功耗
+#define PAIR_TIMEOUT_MS             10000
+
 
 static void ws2812_show(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -45,7 +57,6 @@ static void ws2812_show(uint8_t r, uint8_t g, uint8_t b)
     rgbLedWrite(PIN_LED, r, g, b);
 }
 
-static bool redOn = false;
 static uint32_t redTimer = 0;
 static bool greenActive = false;
 static uint8_t greenStep = 0; // 0-5
@@ -59,6 +70,7 @@ static bool deviceConnected = false;
 
 static bool wasConnected = false;
 static uint32_t connectedAt = 0;
+static uint32_t advStartedAt = 0;  // BLE 广播开始时间，用于配对超时检测
 
 struct ButtonState
 {
@@ -105,6 +117,7 @@ namespace
             deviceConnected = false;
             wasConnected = false;
             greenActive = false; // 取消绿灯闪烁
+            advStartedAt = millis(); // 重置配对超时计时器
             pServer->getAdvertising()->start();
         }
     };
@@ -162,38 +175,9 @@ static bool updateButton(ButtonState& btn, bool& pressedEdge)
     return btn.lastStable == LOW;
 }
 
-void setup()
+// ==================== BLE 初始化（可重复调用） ====================
+static void initBLE()
 {
-    Serial.begin(115200);
-    delay(500);
-
-    // ---- 初始化按键 ----
-    // 上拉模式：引脚内部上拉电阻使能，外部开关接地
-    btnNxt.pin = PIN_BTN_NXT;
-    btnNxt.command = CMD_UP;
-    btnNxt.label = "[NEXT] CMD_UP (0x01)";
-    btnNxt.lastStable = HIGH;
-    btnNxt.lastRaw = HIGH;
-    btnNxt.lastChangeMs = 0;
-
-    btnPre.pin = PIN_BTN_PRE;
-    btnPre.command = CMD_DOWN;
-    btnPre.label = "[PREV] CMD_DOWN (0x02)";
-    btnPre.lastStable = HIGH;
-    btnPre.lastRaw = HIGH;
-    btnPre.lastChangeMs = 0;
-
-    pinMode(PIN_BTN_NXT, INPUT_PULLUP);
-    pinMode(PIN_BTN_PRE, INPUT_PULLUP);
-
-    // ---- 初始化 WS2812 (RMT 外设) ----
-    ws2812_show(0, 0, 0); // 初始熄灭（同时把 GPIO10 拉低，避免悬空）
-
-    Serial.println("\n=============================");
-    Serial.println("esp32h2 paper turner");
-    Serial.println("=============================");
-    Serial.println("Waiting for connection...");
-
     BLEDevice::init("RC-DD-X4");
 
     pServer = BLEDevice::createServer();
@@ -231,20 +215,112 @@ void setup()
     Serial.println("BLE 广播已开始 (Name: RC-DD-X4)");
 }
 
+// ==================== 低功耗模式 ====================
+static void enterLowPowerMode()
+{
+    Serial.println("\n[LOWPOWER] 10s 未配对，进入低功耗模式...");
+
+    // 1. 关闭 WS2812
+    ws2812_show(0, 0, 0);
+
+    // 2. 关闭 BLE（停止广播 + 释放控制器）
+    BLEDevice::deinit();
+    pServer = nullptr;
+    pService = nullptr;
+    pCharacteristic = nullptr;
+    pAdvertising = nullptr;
+
+    // 3. 配置 GPIO 唤醒源（按键 active LOW，低电平唤醒）
+    gpio_wakeup_enable((gpio_num_t)PIN_BTN_NXT, GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)PIN_BTN_PRE, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+
+    // 4. 进入 Light Sleep
+    Serial.println("[LOWPOWER] 进入 light sleep，等待按键唤醒...");
+    Serial.flush();
+    delay(50);
+
+    esp_light_sleep_start();
+
+    // 5. 唤醒后清理 GPIO 唤醒配置
+    gpio_wakeup_disable((gpio_num_t)PIN_BTN_NXT);
+    gpio_wakeup_disable((gpio_num_t)PIN_BTN_PRE);
+
+    Serial.println("[LOWPOWER] 已唤醒，重新初始化...");
+
+    // 6. 等待按键释放（避免唤醒按键误触发翻页）
+    while (digitalRead(PIN_BTN_NXT) == LOW || digitalRead(PIN_BTN_PRE) == LOW)
+    {
+        delay(10);
+    }
+
+    // 7. 重新初始化 BLE
+    initBLE();
+
+    // 8. 重置状态
+    advStartedAt = millis();
+    redTimer = millis();
+    deviceConnected = false;
+    wasConnected = false;
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(500);
+
+    // ---- 初始化按键 ----
+    // 上拉模式：引脚内部上拉电阻使能，外部开关接地
+    btnNxt.pin = PIN_BTN_NXT;
+    btnNxt.command = CMD_UP;
+    btnNxt.label = "[NEXT] CMD_UP (0x01)";
+    btnNxt.lastStable = HIGH;
+    btnNxt.lastRaw = HIGH;
+    btnNxt.lastChangeMs = 0;
+
+    btnPre.pin = PIN_BTN_PRE;
+    btnPre.command = CMD_DOWN;
+    btnPre.label = "[PREV] CMD_DOWN (0x02)";
+    btnPre.lastStable = HIGH;
+    btnPre.lastRaw = HIGH;
+    btnPre.lastChangeMs = 0;
+
+    pinMode(PIN_BTN_NXT, INPUT_PULLUP);
+    pinMode(PIN_BTN_PRE, INPUT_PULLUP);
+
+    // ---- 初始化 WS2812 (RMT 外设) ----
+    ws2812_show(0, 0, 0); // 初始熄灭（同时把 GPIO10 拉低，避免悬空）
+
+    Serial.println("\n=============================");
+    Serial.println("esp32h2 paper turner");
+    Serial.println("=============================");
+    Serial.println("Waiting for connection...");
+
+    initBLE();
+    advStartedAt = millis();
+}
+
 void loop()
 {
     // ==================== 未连接：红灯闪烁 ====================
     if (!deviceConnected)
     {
+        // ==================== 配对超时检测 ====================
+        if (millis() - advStartedAt >= PAIR_TIMEOUT_MS)
+        {
+            enterLowPowerMode();
+            return;
+        }
+
         const uint32_t now = millis();
-        if (now - redTimer >= RED_BLINK_MS)
+        if (now - redTimer >= BREATH_UPDATE_MS)
         {
             redTimer = now;
-            redOn = !redOn;
-            if (redOn)
-                ws2812_show(255, 0, 0);
-            else
-                ws2812_show(0, 0, 0);
+            // 以 advStartedAt 为起点，用正弦波驱动呼吸亮度 0→255→0
+            const uint32_t phaseMs = (now - advStartedAt) % BREATH_PERIOD_MS;
+            const float phase = (float)phaseMs / BREATH_PERIOD_MS * (2.0f * PI);
+            const auto brightness = static_cast<uint8_t>((sinf(phase) * 0.5f + 0.5f) * 255.0f);
+            ws2812_show(brightness, 0, 0);
         }
 
         static uint32_t lastPrint = 0;
